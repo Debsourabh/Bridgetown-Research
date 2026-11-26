@@ -4,11 +4,60 @@
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { RoundedBoxGeometry } from "three/addons/geometries/RoundedBoxGeometry.js";
-import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 import { gsap } from "@/lib/gsap";
 import { AGREED_MIN, BASE_QUESTIONS, BASE_TOTAL } from "@/lib/guide";
 
 const CUT = new Set(["q2", "q7", "q12"]);
+
+// Size of the blocks in the finished row, relative to the camera framing (which
+// stays fixed, so the scattered ring and camera move are unchanged). 1 = fills the width.
+const S = 0.78;
+
+/**
+ * A photo-studio light box for reflections: a warm-to-cool gradient dome with a
+ * big overhead softbox and two tall strip lights. Large, dim emitters (instead of
+ * RoomEnvironment's small hot lamps) give broad, creamy highlights on the blocks.
+ */
+function makeStudioEnv() {
+  const env = new THREE.Scene();
+  const geos: THREE.BufferGeometry[] = [];
+  const mats: THREE.Material[] = [];
+
+  // Gradient dome: bright warm top, soft grey horizon, slightly darker floor
+  const domeGeo = new THREE.SphereGeometry(20, 48, 24);
+  const top = new THREE.Color("#fffaf2"), mid = new THREE.Color("#d6d3d1"), bottom = new THREE.Color("#a8a29e");
+  const pos = domeGeo.attributes.position;
+  const cols = new Float32Array(pos.count * 3);
+  const c = new THREE.Color();
+  for (let i = 0; i < pos.count; i++) {
+    const t = pos.getY(i) / 20; // -1..1
+    if (t > 0) c.copy(mid).lerp(top, Math.pow(t, 0.6));
+    else c.copy(mid).lerp(bottom, Math.pow(-t, 0.8));
+    c.toArray(cols, i * 3);
+  }
+  domeGeo.setAttribute("color", new THREE.BufferAttribute(cols, 3));
+  const domeMat = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide });
+  env.add(new THREE.Mesh(domeGeo, domeMat));
+  geos.push(domeGeo);
+  mats.push(domeMat);
+
+  const panel = (w: number, h: number, intensity: number, tint: string, p: [number, number, number]) => {
+    const g = new THREE.PlaneGeometry(w, h);
+    const m = new THREE.MeshBasicMaterial({ color: new THREE.Color(tint).multiplyScalar(intensity), side: THREE.DoubleSide });
+    const mesh = new THREE.Mesh(g, m);
+    mesh.position.set(...p);
+    mesh.lookAt(0, 0, 0);
+    env.add(mesh);
+    geos.push(g);
+    mats.push(m);
+  };
+  panel(14, 10, 2.4, "#fff6ea", [2, 12, 4]); // overhead key softbox
+  panel(3, 12, 1.6, "#ffffff", [-11, 3, 3]); // left strip
+  panel(3, 12, 1.2, "#e0ecff", [10, 2, -6]); // cool back-right rim strip
+  panel(16, 4, 0.7, "#ffffff", [0, 1, 14]); // broad front fill (lifts the faces)
+
+  return { env, dispose: () => { geos.forEach((g) => g.dispose()); mats.forEach((m) => m.dispose()); } };
+}
 
 /**
  * onReveal fires when the loader starts dissolving (the app builds in underneath,
@@ -45,17 +94,22 @@ export default function IntroScene({ onReveal, onDone }: { onReveal: () => void;
     renderer.setSize(el.clientWidth, el.clientHeight);
     // Neutral tone mapping keeps the brand lime/red true (ACES/AgX wash them out)
     renderer.toneMapping = THREE.NeutralToneMapping;
-    renderer.toneMappingExposure = 1.05;
+    renderer.toneMappingExposure = 1.0;
     renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    // VSM gives genuinely blurred penumbras. (PCFSoftShadowMap was removed in r18x
+    // and silently falls back to hard PCF, which is what made the shadows sharp.)
+    renderer.shadowMap.type = THREE.VSMShadowMap;
     el.prepend(renderer.domElement);
 
     const scene = new THREE.Scene();
-    // Soft studio reflections: what makes the clear-coat read as a material
+    // Image-based light does most of the work, so highlights are broad softbox
+    // shapes instead of pin-point lamps.
     const pmrem = new THREE.PMREMGenerator(renderer);
-    const envTex = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    const studio = makeStudioEnv();
+    const envTex = pmrem.fromScene(studio.env, 0.035).texture;
+    studio.dispose();
     scene.environment = envTex;
-    scene.environmentIntensity = 0.55;
+    scene.environmentIntensity = 0.95;
     const FOV = 32;
     const camera = new THREE.PerspectiveCamera(FOV, el.clientWidth / el.clientHeight, 0.1, 200);
     // distance at which the finished row (+ margin) fits the viewport width
@@ -68,32 +122,35 @@ export default function IntroScene({ onReveal, onDone }: { onReveal: () => void;
     camera.position.set(0, 3.2, dist * 1.25);
     camera.lookAt(0, 0.6, 0);
 
-    // Studio lighting: soft fill, warm key with soft shadows, cool rim from behind
-    scene.add(new THREE.HemisphereLight(0xffffff, 0xe7e5e4, 0.9));
-    const key = new THREE.DirectionalLight(0xfff4e6, 2.1);
-    key.position.set(3.5, 9, 6);
+    // Direct lights are kept gentle: the env carries the look, the key mostly
+    // exists to cast a soft, diffused shadow; the rim just separates the silhouettes.
+    scene.add(new THREE.HemisphereLight(0xffffff, 0xe7e5e4, 0.35));
+    const key = new THREE.DirectionalLight(0xfff4e6, 1.15);
+    key.position.set(2.5, 10, 5);
     key.castShadow = true;
     key.shadow.mapSize.set(1024, 1024);
-    key.shadow.radius = 6;
-    key.shadow.bias = -0.0005;
-    Object.assign(key.shadow.camera, { left: -10, right: 10, top: 6, bottom: -6, near: 1, far: 30 });
+    key.shadow.radius = 14; // VSM blur radius (texels)
+    key.shadow.blurSamples = 20;
+    key.shadow.bias = -0.0004;
+    Object.assign(key.shadow.camera, { left: -9, right: 9, top: 5, bottom: -5, near: 2, far: 24 });
     scene.add(key);
-    const rim = new THREE.DirectionalLight(0xdbeafe, 1.4);
-    rim.position.set(-6, 3, -8);
+    const rim = new THREE.DirectionalLight(0xe0ecff, 0.55);
+    rim.position.set(-6, 4, -8);
     scene.add(rim);
 
     // Invisible floor that only catches the soft contact shadows
     const floorGeo = new THREE.PlaneGeometry(60, 30);
-    const floorMat = new THREE.ShadowMaterial({ color: 0x1c1917, opacity: 0.1 });
+    const floorMat = new THREE.ShadowMaterial({ color: 0x292524, opacity: 0.16 });
     const floor = new THREE.Mesh(floorGeo, floorMat);
     floor.rotation.x = -Math.PI / 2;
-    floor.position.y = -0.42;
+    floor.position.y = -0.42 * S;
     floor.receiveShadow = true;
     scene.add(floor);
 
     // One block per question, length = estimated minutes (same idea as the Fit preview).
-    const unit = 0.34;
-    const gap = 0.06;
+    const unit = 0.34 * S;
+    const gap = 0.06 * S;
+    const thick = 0.55 * S;
     const rowWidth = BASE_TOTAL * unit + gap * (BASE_QUESTIONS.length - 1);
     const lime = new THREE.Color("#d9f99d");
     const limeDeep = new THREE.Color("#bef264");
@@ -106,20 +163,25 @@ export default function IntroScene({ onReveal, onDone }: { onReveal: () => void;
     let x = -rowWidth / 2;
     const blocks = BASE_QUESTIONS.map((q, i) => {
       const w = q.minutes * unit;
-      const geo = new RoundedBoxGeometry(w, 0.55, 0.55, 5, 0.13);
-      // A soft-touch lacquer: satin base, thin clear-coat, a whisper of sheen on
-      // the edges, and a slight tint shift per block so the row isn't flat.
+      // More bevel segments: the rounded edges catch the softbox as one smooth sweep
+      const geo = new RoundedBoxGeometry(w, thick, thick, 8, 0.15 * S);
+      // Lacquered ceramic: a matte, slightly velvety body under a glossy but
+      // diffused clear-coat. The coat gives the polished softbox highlight; the
+      // rough base keeps the colour rich instead of plasticky. Tint shifts per
+      // block so the row isn't flat.
       const tint = lime.clone().lerp(new THREE.Color("#ecfccb"), (i % 3) * 0.18);
       const mat = new THREE.MeshPhysicalMaterial({
         color: tint,
-        roughness: 0.38,
+        roughness: 0.62,
         metalness: 0,
-        clearcoat: 0.65,
-        clearcoatRoughness: 0.22,
-        sheen: 0.5,
-        sheenRoughness: 0.45,
+        clearcoat: 1,
+        clearcoatRoughness: 0.16,
+        sheen: 0.35,
+        sheenRoughness: 0.6,
         sheenColor: new THREE.Color("#f7fee7"),
-        specularIntensity: 0.6,
+        specularIntensity: 0.35,
+        ior: 1.45,
+        envMapIntensity: 1,
       });
       geos.push(geo);
       mats.push(mat);
@@ -138,12 +200,12 @@ export default function IntroScene({ onReveal, onDone }: { onReveal: () => void;
 
     // 25-min marker: a thin dark bar that drops in at the agreed length
     const markerX = -rowWidth / 2 + AGREED_MIN * unit + gap * 7.5;
-    const markerGeo = new THREE.BoxGeometry(0.035, 1.6, 0.035);
-    const markerMat = new THREE.MeshPhysicalMaterial({ color: 0x0a0a0a, roughness: 0.3, clearcoat: 1, transparent: true, opacity: 0 });
+    const markerGeo = new THREE.BoxGeometry(0.035, 1.6 * S, 0.035);
+    const markerMat = new THREE.MeshPhysicalMaterial({ color: 0x0c0a09, roughness: 0.45, clearcoat: 1, clearcoatRoughness: 0.12, transparent: true, opacity: 0 });
     geos.push(markerGeo);
     mats.push(markerMat);
     const marker = new THREE.Mesh(markerGeo, markerMat);
-    marker.position.set(markerX, 0.2, 0.4);
+    marker.position.set(markerX, 0.2 * S, 0.4 * S);
     scene.add(marker);
 
     let raf = 0;
